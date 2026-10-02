@@ -110,7 +110,37 @@ class SQLiteRepository:
             if (entity["id"] == value if field == "id" else entity["data"].get(field) == value)
         ]
 
-    def update_entity(self, entity_id, expected_version, status, data):
+    def find_entities_tx(self, connection, kind, field, value):
+        """Find entities using an existing transaction connection."""
+        rows = connection.execute(
+            "SELECT * FROM entities WHERE kind = ? ORDER BY created_at, id", (kind,)
+        ).fetchall()
+        entities = [self._entity_from_row(row) for row in rows]
+        if field == "id":
+            return [entity for entity in entities if entity["id"] == value]
+        return [entity for entity in entities if entity["data"].get(field) == value]
+
+    def update_entity_tx(self, connection, entity_id, status, data):
+        """Update an entity inside an existing transaction (no version bump check)."""
+        now = utcnow()
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        connection.execute(
+            "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+            "WHERE id = ?",
+            (status, payload, now, entity_id),
+        )
+
+    def create_entity_tx(self, connection, entity_id, kind, status, data, actor_id):
+        """Create an entity inside an existing transaction."""
+        now = utcnow()
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        connection.execute(
+            "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+            "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
+            (entity_id, kind, status, payload, actor_id, now, now),
+        )
+
+    def update_entity(self, entity_id, expected_version, status, data, guard=None, after_update=None):
         now = utcnow()
         payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
         connection = self._connect()
@@ -127,11 +157,17 @@ class SQLiteRepository:
                     "version conflict: expected %s, found %s"
                     % (expected_version, current_version)
                 )
+            # Re-validate against the latest committed state inside the write
+            # transaction so concurrent callers observe the newest restriction.
+            if guard is not None:
+                guard(connection)
             connection.execute(
                 "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
                 "WHERE id = ? AND version = ?",
                 (status, payload, now, entity_id, current_version),
             )
+            if after_update is not None:
+                after_update(connection)
             connection.commit()
         except Exception:
             connection.rollback()

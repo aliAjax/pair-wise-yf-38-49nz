@@ -8,15 +8,29 @@ from .domain import (
 )
 
 
+# Applications that have not reached a terminal decision.
+OPEN_APPLICATION_STATUSES = ("draft", "submitted", "under_review")
+
+
 def _validate_dataset(actor, data, lookup):
     if len(data.get("access_policy", "")) < 3:
         raise ValidationError("access_policy is required")
+
+
+def _validate_organization(actor, data, lookup):
+    if not data.get("name", "").strip():
+        raise ValidationError("name is required")
 
 
 def _validate_application(actor, data, lookup):
     dataset = _find_one(lookup, "dataset", "id", data.get("dataset_id"))
     if not dataset:
         raise ValidationError("dataset does not exist")
+    if not data.get("organization_id"):
+        raise ValidationError("organization_id is required")
+    org = _find_one(lookup, "organization", "id", data.get("organization_id"))
+    if not org:
+        raise ValidationError("organization does not exist")
     if not data.get("purpose", "").strip():
         raise ValidationError("purpose is required")
 
@@ -27,6 +41,12 @@ def _validate_approve(actor, entity, data, lookup):
         raise ValidationError("at least three distinct committee approvals are required")
     if data.get("conflict_of_interest"):
         raise PermissionDenied("conflicted reviewer cannot approve access")
+    org = _find_one(lookup, "organization", "id", entity["data"].get("organization_id"))
+    if org and org["status"] == "suspended":
+        raise ValidationError(
+            "cannot approve while organization is suspended; "
+            "destruction receipt pending verification"
+        )
 
 
 def valid_grant_window(expires_at, as_of):
@@ -36,21 +56,110 @@ def valid_grant_window(expires_at, as_of):
 def _validate_grant_activate(actor, entity, data, lookup):
     if data.get("expires_at") < data.get("starts_at"):
         raise ValidationError("grant expiry must be after start")
+    org = _find_one(lookup, "organization", "id", entity["data"].get("recipient"))
+    if org and org["status"] == "suspended":
+        raise ValidationError(
+            "cannot activate grant while organization is suspended; "
+            "destruction receipt pending verification"
+        )
+    if org:
+        apps = lookup("application", "organization_id", org["id"]) or []
+        open_apps = [a for a in apps if a["status"] in OPEN_APPLICATION_STATUSES]
+        if open_apps:
+            raise ValidationError("cannot activate grant while applications are open")
     return {"activated_by": actor.user_id}
 
 
-CUSTOM_CREATE = {'dataset': _validate_dataset, 'application': _validate_application}
-CUSTOM_TRANSITIONS = {('application', 'approve'): _validate_approve, ('grant', 'activate'): _validate_grant_activate}
+def _validate_receipt_verify(actor, entity, data, lookup):
+    return {"verified_by": actor.user_id}
+
+
+CUSTOM_CREATE = {
+    'dataset': _validate_dataset,
+    'application': _validate_application,
+    'organization': _validate_organization,
+}
+CUSTOM_TRANSITIONS = {
+    ('application', 'approve'): _validate_approve,
+    ('grant', 'activate'): _validate_grant_activate,
+    ('receipt', 'verify'): _validate_receipt_verify,
+}
 
 
 class RuleEngine:
-    ALIASES = {'datasets': 'dataset', 'applications': 'application', 'grants': 'grant'}
-    INITIAL_STATUS = {'dataset': 'registered', 'application': 'draft', 'grant': 'issued'}
-    TRANSITIONS = {'dataset': {'restrict': (('registered',), 'restricted'), 'publish': (('restricted',), 'published')}, 'application': {'submit': (('draft',), 'submitted'), 'review': (('submitted',), 'under_review'), 'approve': (('under_review',), 'approved'), 'reject': (('under_review',), 'rejected'), 'withdraw': (('submitted', 'under_review'), 'withdrawn')}, 'grant': {'activate': (('issued',), 'active'), 'revoke': (('active',), 'revoked'), 'expire': (('active',), 'expired')}}
-    CREATE_REQUIRED = {'dataset': ('name', 'access_policy'), 'application': ('dataset_id', 'applicant_id', 'purpose'), 'grant': ('application_id', 'dataset_id', 'recipient')}
-    ACTION_REQUIRED = {('dataset', 'restrict'): ('reason',), ('application', 'review'): ('committee_id',), ('application', 'approve'): ('approvals', 'terms', 'expires_at'), ('application', 'reject'): ('reason',), ('application', 'withdraw'): ('reason',), ('grant', 'activate'): ('starts_at', 'expires_at'), ('grant', 'revoke'): ('reason',), ('grant', 'expire'): ('expired_at',)}
-    CREATE_ROLES = {'dataset': ('admin', 'committee'), 'application': ('admin', 'applicant'), 'grant': ('admin', 'committee')}
-    ROLE_ACTIONS = {'restrict': ('admin', 'committee'), 'publish': ('admin', 'committee'), 'submit': ('admin', 'applicant'), 'review': ('admin', 'committee'), 'approve': ('admin', 'committee'), 'reject': ('admin', 'committee'), 'withdraw': ('admin', 'applicant'), 'activate': ('admin', 'committee'), 'revoke': ('admin', 'committee'), 'expire': ('admin', 'committee')}
+    OPEN_APPLICATION_STATUSES = OPEN_APPLICATION_STATUSES
+    ALIASES = {
+        'datasets': 'dataset',
+        'applications': 'application',
+        'grants': 'grant',
+        'organizations': 'organization',
+        'receipts': 'receipt',
+    }
+    INITIAL_STATUS = {
+        'dataset': 'registered',
+        'application': 'draft',
+        'grant': 'issued',
+        'organization': 'active',
+        'receipt': 'pending',
+    }
+    TRANSITIONS = {
+        'dataset': {
+            'restrict': (('registered',), 'restricted'),
+            'publish': (('restricted',), 'published'),
+        },
+        'application': {
+            'submit': (('draft',), 'submitted'),
+            'review': (('submitted',), 'under_review'),
+            'approve': (('under_review',), 'approved'),
+            'reject': (('under_review',), 'rejected'),
+            'withdraw': (('submitted', 'under_review'), 'withdrawn'),
+        },
+        'grant': {
+            'activate': (('issued',), 'active'),
+            'revoke': (('active',), 'revoked'),
+            'expire': (('active',), 'expired'),
+        },
+        'receipt': {
+            'verify': (('pending',), 'verified'),
+        },
+    }
+    CREATE_REQUIRED = {
+        'dataset': ('name', 'access_policy'),
+        'application': ('dataset_id', 'organization_id', 'applicant_id', 'purpose'),
+        'grant': ('application_id', 'dataset_id', 'recipient'),
+        'organization': ('name',),
+        'receipt': ('organization_id', 'grant_id'),
+    }
+    ACTION_REQUIRED = {
+        ('dataset', 'restrict'): ('reason',),
+        ('application', 'review'): ('committee_id',),
+        ('application', 'approve'): ('approvals', 'terms', 'expires_at'),
+        ('application', 'reject'): ('reason',),
+        ('application', 'withdraw'): ('reason',),
+        ('grant', 'activate'): ('starts_at', 'expires_at'),
+        ('grant', 'revoke'): ('reason',),
+        ('grant', 'expire'): ('expired_at',),
+    }
+    CREATE_ROLES = {
+        'dataset': ('admin', 'committee'),
+        'application': ('admin', 'applicant'),
+        'grant': ('admin', 'committee'),
+        'organization': ('admin', 'committee'),
+        'receipt': ('admin', 'committee'),
+    }
+    ROLE_ACTIONS = {
+        'restrict': ('admin', 'committee'),
+        'publish': ('admin', 'committee'),
+        'submit': ('admin', 'applicant'),
+        'review': ('admin', 'committee'),
+        'approve': ('admin', 'committee'),
+        'reject': ('admin', 'committee'),
+        'withdraw': ('admin', 'applicant'),
+        'activate': ('admin', 'committee'),
+        'revoke': ('admin', 'committee'),
+        'expire': ('admin', 'committee'),
+        'verify': ('admin', 'auditor'),
+    }
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
