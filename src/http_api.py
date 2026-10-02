@@ -85,6 +85,20 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts == ["api", "governance"]:
+                    query = parse_qs(parsed.query)
+                    recipient = query.get("recipient", [None])[0]
+                    return self._send(200, service.governance_summary(recipient=recipient))
+                if parts == ["api", "pending"]:
+                    actor = self._actor()
+                    if actor.role not in ("admin", "auditor"):
+                        raise PermissionDenied("only admin or auditor may inspect pending items")
+                    return self._send(200, {"items": service.list_pending()})
+                if len(parts) == 4 and parts[:2] == ["api", "pending"] and parts[3] == "retry":
+                    actor = self._actor()
+                    if actor.role not in ("admin", "auditor"):
+                        raise PermissionDenied("only admin or auditor may retry pending items")
+                    return self._send(200, service.retry_pending(parts[2]))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":

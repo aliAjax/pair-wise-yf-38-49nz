@@ -25,6 +25,16 @@ python3 app.py --db ./data.db --port 8304
 ## 核心对象
 
 - `dataset`：受控数据集；`application`：访问申请；`grant`：限时数据使用凭证。
+- `destruction_receipt`：凭证到期或撤销后机构提交的数据销毁回执，初始 `pending`，由管理员或审计员核对后变为 `verified`。
+
+## 机构停用治理
+
+- 凭证处于 `revoked`/`expired` 后，机构可提交销毁回执（`POST /api/destruction_receipts`，只需 `grant_id`）；同一凭证重复提交返回 409，不生成第二份回执。
+- 回执核对（动作 `verify`，需要 `{"confirmed": true}`）仅 `admin`/`auditor` 可执行；核对通过后，该凭证对应的已批准申请在同一事务内办结为 `closed`。
+- 存在**待核回执**时：同机构新申请的 `approve` 被阻断，新凭证的 `activate` 也被阻断，已批准结果不能绕过待核回执。
+- 机构仍有**未结申请**（`draft/submitted/under_review/approved`，本凭证对应申请除外）时，新凭证不能启用。
+- 跨对象限制在 `BEGIN IMMEDIATE` 写事务内以最新数据重读校验；核对与审批并发提交时由数据库串行化，后到一方一定读到最新限制。
+- 事务提交后审计写入失败时，剩余审计事件保留到 `pending_items` 表（待续项），可通过接口重试。
 
 ## 主要接口
 
@@ -33,6 +43,8 @@ python3 app.py --db ./data.db --port 8304
 - `POST /api/<kind>`：创建对象；请求体为JSON。
 - `GET /api/entities/<id>`：读取对象当前版本。
 - `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。
+- `GET /api/governance`：机构停用治理总览（未结申请、待核回执、待续项），可用 `?recipient=` 按机构过滤。
+- `GET /api/pending` / `POST /api/pending/<id>/retry`：查看与重试待续项（仅 `admin`/`auditor`）。
 - `GET /api/audit`：读取审计记录。
 
 请求身份通过`X-User-Id`和`X-Role`请求头传入。创建和动作的可执行角色由规则引擎控制。
